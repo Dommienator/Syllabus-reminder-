@@ -1,1 +1,415 @@
 
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>SyllabuSync</title>
+  <link href="https://fonts.googleapis.com/css2?family=Syne:wght@700;800&family=DM+Sans:wght@400;500;600&display=swap" rel="stylesheet" />
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.2/babel.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js"></script>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body { background: #0e0e12; color: #e8e8f0; font-family: 'DM Sans', sans-serif; }
+    @keyframes fadeUp {
+      from { opacity: 0; transform: translateY(12px); }
+      to { opacity: 1; transform: translateY(0); }
+    }
+    @keyframes spin { to { transform: rotate(360deg); } }
+    ::-webkit-scrollbar { width: 6px; }
+    ::-webkit-scrollbar-track { background: #0e0e12; }
+    ::-webkit-scrollbar-thumb { background: #2a2a38; border-radius: 3px; }
+    input[type=date]::-webkit-calendar-picker-indicator { filter: invert(0.5); }
+    textarea:focus, input:focus { outline: none; }
+  </style>
+</head>
+<body>
+  <div id="root"></div>
+
+  <script type="text/babel">
+    const { useState, useRef, useCallback } = React;
+
+    const C = {
+      bg: "#0e0e12", surface: "#16161e", border: "#2a2a38",
+      accent: "#f0c040", accentDim: "#f0c04022", text: "#e8e8f0",
+      muted: "#6b6b80", danger: "#e05c5c", success: "#4ecb8d",
+    };
+
+    const PRIORITY_COLORS = { high: "#e05c5c", medium: "#f0c040", low: "#4ecb8d" };
+    const TYPE_ICONS = {
+      assignment: "📝", exam: "📋", quiz: "✏️", project: "🗂️",
+      reading: "📖", lecture: "🎓", other: "📌"
+    };
+
+    function generateICS(tasks) {
+      const pad = n => String(n).padStart(2, "0");
+      const toICSDate = d => {
+        const dt = new Date(d);
+        return `${dt.getFullYear()}${pad(dt.getMonth()+1)}${pad(dt.getDate())}`;
+      };
+      const uid = () => Math.random().toString(36).slice(2) + Date.now();
+
+      const events = tasks.filter(t => t.date).map(t => {
+        const date = toICSDate(t.date);
+        return [
+          "BEGIN:VEVENT",
+          `UID:${uid()}@syllabusync`,
+          `DTSTART;VALUE=DATE:${date}`,
+          `DTEND;VALUE=DATE:${date}`,
+          `SUMMARY:${t.title}`,
+          `DESCRIPTION:${(t.description||"").replace(/\n/g,"\\n")} | Course: ${t.course||""}`,
+          `CATEGORIES:${(t.type||"TASK").toUpperCase()}`,
+          "BEGIN:VALARM", "TRIGGER:-P1D", "ACTION:DISPLAY",
+          `DESCRIPTION:Due tomorrow: ${t.title}`, "END:VALARM",
+          "BEGIN:VALARM", "TRIGGER:-P3D", "ACTION:DISPLAY",
+          `DESCRIPTION:Due in 3 days: ${t.title}`, "END:VALARM",
+          "END:VEVENT"
+        ].join("\r\n");
+      });
+
+      return ["BEGIN:VCALENDAR","VERSION:2.0","PRODID:-//SyllabuSync//EN",
+              "CALSCALE:GREGORIAN","METHOD:PUBLISH",...events,"END:VCALENDAR"].join("\r\n");
+    }
+
+    function downloadICS(tasks) {
+      const blob = new Blob([generateICS(tasks)], { type: "text/calendar;charset=utf-8" });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url; a.download = "syllabusync.ics"; a.click();
+      URL.revokeObjectURL(url);
+    }
+
+    async function parseSyllabus(sources, apiKey) {
+      const prompt = `You are an academic schedule parser. Extract ALL tasks, deadlines, exams, assignments, quizzes, projects from the provided content.
+Return ONLY a valid JSON array, no markdown, no explanation. Each item:
+{"title":"short name","date":"YYYY-MM-DD or null","type":"assignment|exam|quiz|project|reading|lecture|other","priority":"high|medium|low","course":"course name or code","description":"brief detail"}
+Rules: deduplicate across sources, use end/due date for ranges, exams=high priority, assignments=medium, readings=low. Return [] if nothing found.
+
+${sources.map((s,i) => `--- Source ${i+1}: ${s.name} ---\n${s.content}`).join("\n\n")}`;
+
+      const res = await fetch(
+        `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${apiKey}`,
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            contents: [{ parts: [{ text: prompt }] }],
+            generationConfig: { temperature: 0.1 }
+          })
+        }
+      );
+
+      if (!res.ok) {
+        const err = await res.json();
+        throw new Error(err?.error?.message || "Gemini API error");
+      }
+      const data = await res.json();
+      const text = data.candidates?.[0]?.content?.parts?.[0]?.text || "[]";
+      return JSON.parse(text.replace(/```json|```/g,"").trim());
+    }
+
+    function readFile(file) {
+      return new Promise((resolve) => {
+        const reader = new FileReader();
+        reader.onload = e => resolve(e.target.result);
+        if (file.type === "application/pdf") {
+          resolve(`[PDF: ${file.name} — paste the text content separately for best results]`);
+        } else {
+          reader.readAsText(file);
+        }
+      });
+    }
+
+    function FileChip({ file, onRemove }) {
+      const ext = file.name.split(".").pop().toUpperCase();
+      return (
+        <div style={{display:"inline-flex",alignItems:"center",gap:6,
+          background:C.accentDim,border:`1px solid ${C.accent}44`,
+          borderRadius:6,padding:"4px 10px",fontSize:12,color:C.accent,fontFamily:"monospace"}}>
+          <span style={{opacity:0.6}}>{ext}</span>
+          <span style={{color:C.text,maxWidth:130,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{file.name}</span>
+          <button onClick={onRemove} style={{background:"none",border:"none",cursor:"pointer",
+            color:C.muted,fontSize:16,padding:0,lineHeight:1}}>×</button>
+        </div>
+      );
+    }
+
+    function TaskCard({ task, index, onChange, onRemove }) {
+      const [editing, setEditing] = useState(false);
+      return (
+        <div style={{background:C.surface,border:`1px solid ${C.border}`,
+          borderLeft:`3px solid ${PRIORITY_COLORS[task.priority]||C.muted}`,
+          borderRadius:8,padding:"14px 16px",display:"flex",flexDirection:"column",gap:6,
+          animation:`fadeUp 0.3s ease ${index*0.04}s both`}}>
+          <div style={{display:"flex",alignItems:"flex-start",gap:10}}>
+            <span style={{fontSize:18,flexShrink:0}}>{TYPE_ICONS[task.type]||"📌"}</span>
+            <div style={{flex:1,minWidth:0}}>
+              {editing
+                ? <input value={task.title} onChange={e=>onChange({...task,title:e.target.value})}
+                    style={{background:C.bg,border:`1px solid ${C.accent}`,borderRadius:4,
+                      color:C.text,padding:"4px 8px",fontSize:14,fontWeight:600,width:"100%",fontFamily:"inherit"}}/>
+                : <div style={{fontWeight:600,fontSize:14,color:C.text}}>{task.title}</div>
+              }
+              {task.course && <div style={{fontSize:11,color:"#5b8af0",marginTop:2}}>{task.course}</div>}
+            </div>
+            <div style={{display:"flex",gap:6,flexShrink:0}}>
+              <button onClick={()=>setEditing(!editing)} style={{background:"none",border:`1px solid ${C.border}`,
+                borderRadius:4,color:C.muted,cursor:"pointer",fontSize:11,padding:"2px 8px"}}>
+                {editing?"done":"edit"}
+              </button>
+              <button onClick={onRemove} style={{background:"none",border:`1px solid ${C.danger}33`,
+                borderRadius:4,color:C.danger,cursor:"pointer",fontSize:11,padding:"2px 8px"}}>×</button>
+            </div>
+          </div>
+          <div style={{display:"flex",gap:8,flexWrap:"wrap",alignItems:"center",paddingLeft:28}}>
+            {editing
+              ? <input type="date" value={task.date||""} onChange={e=>onChange({...task,date:e.target.value})}
+                  style={{background:C.bg,border:`1px solid ${C.border}`,borderRadius:4,
+                    color:C.text,padding:"3px 8px",fontSize:12,fontFamily:"monospace"}}/>
+              : task.date && <span style={{fontSize:12,color:C.accent,fontFamily:"monospace",
+                  background:C.accentDim,padding:"2px 8px",borderRadius:4}}>{task.date}</span>
+            }
+            <span style={{fontSize:11,padding:"2px 8px",borderRadius:4,
+              background:`${PRIORITY_COLORS[task.priority]}22`,
+              color:PRIORITY_COLORS[task.priority],textTransform:"uppercase",fontWeight:700}}>
+              {task.priority}
+            </span>
+            <span style={{fontSize:11,padding:"2px 8px",borderRadius:4,
+              background:C.border,color:C.muted,textTransform:"capitalize"}}>{task.type}</span>
+          </div>
+          {task.description && (
+            <div style={{fontSize:12,color:C.muted,paddingLeft:28,lineHeight:1.5}}>{task.description}</div>
+          )}
+        </div>
+      );
+    }
+
+    function App() {
+      const [apiKey, setApiKey] = useState("");
+      const [apiKeySaved, setApiKeySaved] = useState(false);
+      const [files, setFiles] = useState([]);
+      const [pastedText, setPastedText] = useState("");
+      const [tasks, setTasks] = useState([]);
+      const [loading, setLoading] = useState(false);
+      const [error, setError] = useState("");
+      const [step, setStep] = useState("input");
+      const [dragOver, setDragOver] = useState(false);
+      const fileInputRef = useRef();
+
+      const handleFiles = useCallback(newFiles => {
+        const valid = Array.from(newFiles).filter(f =>
+          f.name.match(/\.(pdf|txt|md|doc|docx)$/i)
+        );
+        setFiles(prev => [...prev, ...valid]);
+      }, []);
+
+      const handleParse = async () => {
+        if (!apiKey.trim()) { setError("Please enter your Gemini API key first."); return; }
+        if (files.length === 0 && !pastedText.trim()) { setError("Please add a file or paste some text."); return; }
+        setError(""); setLoading(true);
+        try {
+          const sources = [];
+          for (const file of files) {
+            const content = await readFile(file);
+            sources.push({ name: file.name, content: String(content).slice(0, 8000) });
+          }
+          if (pastedText.trim()) sources.push({ name: "Pasted Text", content: pastedText.trim().slice(0, 8000) });
+          const parsed = await parseSyllabus(sources, apiKey.trim());
+          setTasks(parsed.map((t,i) => ({...t, id: i+1})));
+          setStep("review");
+        } catch(err) {
+          setError(err.message || "Something went wrong. Please try again.");
+        } finally {
+          setLoading(false);
+        }
+      };
+
+      const updateTask = (id, updated) => setTasks(prev => prev.map(t => t.id===id ? {...t,...updated} : t));
+      const removeTask = id => setTasks(prev => prev.filter(t => t.id!==id));
+      const addTask = () => {
+        const newId = Math.max(...tasks.map(t=>t.id), 0) + 1;
+        setTasks(prev => [...prev, {id:newId,title:"New Task",date:"",type:"assignment",priority:"medium",course:"",description:""}]);
+      };
+
+      const s = {
+        btn: { border:"none", borderRadius:8, cursor:"pointer", fontFamily:"'DM Sans',sans-serif", fontWeight:600 },
+        card: { background:C.surface, border:`1px solid ${C.border}`, borderRadius:8, padding:"16px" },
+        input: { background:C.surface, border:`1px solid ${C.border}`, borderRadius:8,
+          color:C.text, padding:"10px 14px", fontSize:14, fontFamily:"'DM Sans',sans-serif", width:"100%" }
+      };
+
+      return (
+        <div style={{minHeight:"100vh",background:C.bg,color:C.text,paddingBottom:60}}>
+          <div style={{borderBottom:`1px solid ${C.border}`,padding:"16px 20px",
+            background:C.surface,position:"sticky",top:0,zIndex:10,
+            display:"flex",alignItems:"center",justifyContent:"space-between"}}>
+            <div>
+              <div style={{fontFamily:"'Syne',sans-serif",fontSize:20,fontWeight:800,color:C.accent}}>
+                SyllabuSync
+              </div>
+              <div style={{fontSize:11,color:C.muted}}>Syllabus → Calendar reminders</div>
+            </div>
+            {step==="review" && (
+              <button onClick={()=>{setStep("input");setTasks([]);}}
+                style={{...s.btn,background:"none",border:`1px solid ${C.border}`,
+                  color:C.muted,fontSize:12,padding:"6px 14px"}}>← Back</button>
+            )}
+          </div>
+
+          <div style={{maxWidth:640,margin:"0 auto",padding:"24px 16px"}}>
+            {step==="input" && (
+              <div style={{...s.card,marginBottom:24,animation:"fadeUp 0.3s ease both"}}>
+                <div style={{fontSize:12,color:C.muted,marginBottom:8,fontWeight:600}}>
+                  🔑 GEMINI API KEY (FREE)
+                </div>
+                <div style={{display:"flex",gap:8}}>
+                  <input
+                    type={apiKeySaved ? "password" : "text"}
+                    placeholder="AIza..."
+                    value={apiKey}
+                    onChange={e=>{setApiKey(e.target.value);setApiKeySaved(false);}}
+                    style={{...s.input,flex:1,fontSize:13,fontFamily:"monospace"}}
+                  />
+                  <button onClick={()=>setApiKeySaved(true)}
+                    style={{...s.btn,background:apiKeySaved?C.success:C.accent,
+                      color:"#0e0e12",padding:"0 16px",fontSize:13,flexShrink:0}}>
+                    {apiKeySaved?"✓":"Save"}
+                  </button>
+                </div>
+                <div style={{fontSize:11,color:C.muted,marginTop:8,lineHeight:1.5}}>
+                  Get your free key at <span style={{color:C.accent}}>aistudio.google.com</span> → "Get API Key". Free forever. Stays in your browser only.
+                </div>
+              </div>
+            )}
+
+            {step==="input" && (
+              <div style={{animation:"fadeUp 0.35s ease 0.05s both"}}>
+                <h2 style={{fontFamily:"'Syne',sans-serif",fontSize:24,fontWeight:800,marginBottom:6}}>
+                  Drop your course materials.
+                </h2>
+                <p style={{color:C.muted,fontSize:13,marginBottom:24,lineHeight:1.6}}>
+                  Upload multiple files and/or paste text from any source. AI will extract all tasks and deadlines.
+                </p>
+                <div
+                  onDrop={e=>{e.preventDefault();setDragOver(false);handleFiles(e.dataTransfer.files);}}
+                  onDragOver={e=>{e.preventDefault();setDragOver(true);}}
+                  onDragLeave={()=>setDragOver(false)}
+                  onClick={()=>fileInputRef.current?.click()}
+                  style={{border:`2px dashed ${dragOver?C.accent:C.border}`,borderRadius:12,
+                    padding:"32px 20px",textAlign:"center",cursor:"pointer",
+                    background:dragOver?C.accentDim:"transparent",marginBottom:14,transition:"all 0.2s"}}>
+                  <div style={{fontSize:28,marginBottom:8}}>📂</div>
+                  <div style={{fontSize:14,fontWeight:500}}>Tap to upload files</div>
+                  <div style={{fontSize:12,color:C.muted,marginTop:4}}>PDF, TXT, DOCX, MD — multiple files OK</div>
+                  <input ref={fileInputRef} type="file" multiple accept=".pdf,.txt,.doc,.docx,.md"
+                    style={{display:"none"}} onChange={e=>handleFiles(e.target.files)}/>
+                </div>
+
+                {files.length > 0 && (
+                  <div style={{display:"flex",flexWrap:"wrap",gap:8,marginBottom:16}}>
+                    {files.map((f,i) => (
+                      <FileChip key={i} file={f} onRemove={()=>setFiles(prev=>prev.filter((_,j)=>j!==i))}/>
+                    ))}
+                  </div>
+                )}
+
+                <div style={{marginBottom:20}}>
+                  <div style={{fontSize:12,color:C.muted,marginBottom:8,fontWeight:600}}>OR PASTE TEXT</div>
+                  <textarea
+                    value={pastedText}
+                    onChange={e=>setPastedText(e.target.value)}
+                    placeholder="Paste syllabus, assignment schedule, email from lecturer..."
+                    rows={5}
+                    style={{...s.input,resize:"vertical",lineHeight:1.6}}
+                    onFocus={e=>e.target.style.borderColor=C.accent}
+                    onBlur={e=>e.target.style.borderColor=C.border}
+                  />
+                </div>
+
+                {error && (
+                  <div style={{background:`${C.danger}15`,border:`1px solid ${C.danger}44`,
+                    borderRadius:8,padding:"10px 14px",fontSize:13,color:C.danger,marginBottom:16}}>
+                    {error}
+                  </div>
+                )}
+
+                <button onClick={handleParse} disabled={loading}
+                  style={{...s.btn,width:"100%",background:C.accent,color:"#0e0e12",
+                    padding:"14px",fontSize:15,fontFamily:"'Syne',sans-serif",fontWeight:700,
+                    opacity:loading?0.7:1,display:"flex",alignItems:"center",justifyContent:"center",gap:10}}>
+                  {loading
+                    ? <><div style={{width:16,height:16,border:"2px solid #0e0e12",
+                        borderTopColor:"transparent",borderRadius:"50%",animation:"spin 0.7s linear infinite"}}/> Analysing...</>
+                    : "Extract Schedule →"
+                  }
+                </button>
+              </div>
+            )}
+
+            {step==="review" && (
+              <div style={{animation:"fadeUp 0.3s ease both"}}>
+                <div style={{display:"grid",gridTemplateColumns:"repeat(3,1fr)",gap:10,marginBottom:24}}>
+                  {[
+                    {label:"Tasks",value:tasks.length,color:C.text},
+                    {label:"High Priority",value:tasks.filter(t=>t.priority==="high").length,color:C.danger},
+                    {label:"With Dates",value:tasks.filter(t=>t.date).length,color:C.success},
+                  ].map(stat=>(
+                    <div key={stat.label} style={{...s.card,textAlign:"center",padding:"12px 8px"}}>
+                      <div style={{fontSize:24,fontWeight:800,color:stat.color,fontFamily:"'Syne',sans-serif"}}>{stat.value}</div>
+                      <div style={{fontSize:10,color:C.muted,marginTop:2}}>{stat.label}</div>
+                    </div>
+                  ))}
+                </div>
+
+                <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:14}}>
+                  <div style={{fontFamily:"'Syne',sans-serif",fontSize:15,fontWeight:700}}>Review & Edit</div>
+                  <button onClick={addTask}
+                    style={{...s.btn,background:C.accentDim,border:`1px solid ${C.accent}44`,
+                      color:C.accent,fontSize:12,padding:"6px 14px"}}>+ Add</button>
+                </div>
+
+                <div style={{display:"flex",flexDirection:"column",gap:10,marginBottom:24}}>
+                  {tasks
+                    .sort((a,b)=>{
+                      if(!a.date&&!b.date) return 0;
+                      if(!a.date) return 1; if(!b.date) return -1;
+                      return new Date(a.date)-new Date(b.date);
+                    })
+                    .map((task,i)=>(
+                      <TaskCard key={task.id} task={task} index={i}
+                        onChange={updated=>updateTask(task.id,updated)}
+                        onRemove={()=>removeTask(task.id)}/>
+                    ))
+                  }
+                </div>
+
+                {tasks.length > 0 && (
+                  <div style={{...s.card}}>
+                    <div style={{fontWeight:600,fontSize:14,marginBottom:6}}>Ready to export?</div>
+                    <div style={{fontSize:12,color:C.muted,marginBottom:16,lineHeight:1.6}}>
+                      Download the <strong style={{color:C.text}}>.ics file</strong> and open it on your phone or laptop.
+                      Imports into Google Calendar, Apple Calendar, or Outlook automatically.
+                      Each task includes <strong style={{color:C.text}}>1-day & 3-day reminders</strong>.
+                    </div>
+                    <button onClick={()=>downloadICS(tasks)}
+                      style={{...s.btn,width:"100%",background:C.accent,color:"#0e0e12",
+                        padding:"13px",fontSize:14,fontFamily:"'Syne',sans-serif",fontWeight:700}}>
+                      📅 Download Calendar File (.ics)
+                    </button>
+                    <div style={{fontSize:11,color:C.muted,textAlign:"center",marginTop:10}}>
+                      Google Calendar · Apple Calendar · Outlook · Any calendar app
+                    </div>
+                  </div>
+                )}
+              </div>
+            )}
+          </div>
+        </div>
+      );
+    }
+
+    ReactDOM.createRoot(document.getElementById("root")).render(<App/>);
+  </script>
+</body>
+</html>
